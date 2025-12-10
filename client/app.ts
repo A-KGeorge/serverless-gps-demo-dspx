@@ -47,7 +47,7 @@ const themeToggleBtn = document.getElementById(
 function initMap() {
   map = L.map("map").setView([39.9, 116.4], 12); // Beijing center (Geolife dataset)
 
-  // Create tile layers
+  // Create tile layers with English-only labels
   darkTileLayer = L.tileLayer(
     "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
     {
@@ -56,10 +56,11 @@ function initMap() {
     }
   );
 
+  // Use Thunderforest Transport for English labels (or CARTO light with Latin script)
   lightTileLayer = L.tileLayer(
-    "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
     {
-      attribution: "&copy; OpenStreetMap contributors",
+      attribution: "&copy; OpenStreetMap contributors &copy; CARTO",
       maxZoom: 19,
     }
   );

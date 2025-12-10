@@ -173,7 +173,8 @@ class GPSWorker {
         lon: rawPoint.lon,
         timestamp: rawPoint.timestamp,
       },
-      state
+      state,
+      rawPoint.sensorId
     );
 
     // Save updated state
