@@ -1,0 +1,307 @@
+/**
+ * Velocity Smoother Worker
+ * Stage 3: Applies moving average to velocity data
+ *
+ * Input:  gps:velocity-calculated (sensorId, smoothedLat, smoothedLon, velocity, timestamp)
+ * Output: gps:processed (sensorId, lat, lon, smoothedLat, smoothedLon, velocity, smoothedVelocity, isMoving, timestamp)
+ */
+
+import Redis from "ioredis";
+import { createDspPipeline } from "dspx";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const LOG_FILE = path.join(__dirname, "../logs/velocity-smoother.log");
+
+// Redis configuration
+const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
+const INPUT_STREAM = "gps:velocity-calculated";
+const OUTPUT_CHANNEL = "gps:processed";
+const CONSUMER_GROUP = "velocity-smoothers";
+const CONSUMER_NAME = `velocity-smoother-${process.pid}`;
+
+// Processing configuration
+const BATCH_SIZE = 10;
+const BLOCK_MS = 5000;
+const VELOCITY_WINDOW_SIZE = 5;
+const MOVEMENT_THRESHOLD = 0.5; // 0.5 m/s
+const LOG_BATCH_SIZE = 100;
+
+interface VelocitySmootherState {
+  velocityBuffer: Float32Array;
+  velocityIndex: number;
+  lastTimestamp: number;
+}
+
+interface VelocityGPSPoint {
+  sensorId: string;
+  lat: number;
+  lon: number;
+  smoothedLat: number;
+  smoothedLon: number;
+  velocity: number;
+  timestamp: number;
+}
+
+interface LatencyStats {
+  movingAvgMs: number;
+  totalMs: number;
+}
+
+class VelocitySmootherWorker {
+  private redis: Redis;
+  private pipeline: ReturnType<typeof createDspPipeline>;
+  private states = new Map<string, VelocitySmootherState>();
+  private running = false;
+  private latencyStats: LatencyStats[] = [];
+
+  constructor() {
+    this.redis = new Redis(REDIS_URL);
+
+    // Initialize moving average pipeline (1D)
+    this.pipeline = createDspPipeline();
+    this.pipeline.MovingAverage({
+      mode: "moving",
+      windowSize: VELOCITY_WINDOW_SIZE,
+    });
+
+    // Ensure log directory exists
+    const logDir = path.dirname(LOG_FILE);
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true });
+    }
+
+    // Write CSV header
+    if (!fs.existsSync(LOG_FILE)) {
+      fs.writeFileSync(LOG_FILE, "timestamp,sensorId,movingAvgMs,totalMs\n");
+    }
+  }
+
+  private async initializeConsumerGroup(): Promise<void> {
+    try {
+      await this.redis.xgroup(
+        "CREATE",
+        INPUT_STREAM,
+        CONSUMER_GROUP,
+        "0",
+        "MKSTREAM"
+      );
+      console.log(`✅ Created consumer group: ${CONSUMER_GROUP}`);
+    } catch (err: any) {
+      if (err.message.includes("BUSYGROUP")) {
+        console.log(`✅ Consumer group already exists: ${CONSUMER_GROUP}`);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  async start(): Promise<void> {
+    console.log("🔮 Velocity Smoother Worker starting...");
+    console.log(`   Consumer: ${CONSUMER_NAME}`);
+    console.log(`   Input: ${INPUT_STREAM} → Output: ${OUTPUT_CHANNEL}`);
+
+    await this.initializeConsumerGroup();
+
+    this.running = true;
+
+    while (this.running) {
+      try {
+        const results = await this.redis.xreadgroup(
+          "GROUP",
+          CONSUMER_GROUP,
+          CONSUMER_NAME,
+          "COUNT",
+          BATCH_SIZE,
+          "BLOCK",
+          BLOCK_MS,
+          "STREAMS",
+          INPUT_STREAM,
+          ">"
+        );
+
+        if (!results || results.length === 0) {
+          continue;
+        }
+
+        const [_streamName, messages] = results[0] as [
+          string,
+          [string, string[]][]
+        ];
+
+        for (const [messageId, fields] of messages) {
+          try {
+            await this.processMessage(messageId, fields);
+          } catch (err) {
+            console.error(`❌ Error processing message ${messageId}:`, err);
+          }
+        }
+      } catch (err) {
+        console.error("❌ Error in processing loop:", err);
+        await this.sleep(1000);
+      }
+    }
+
+    console.log("👋 Velocity Smoother Worker stopped");
+  }
+
+  private async processMessage(
+    messageId: string,
+    fields: string[]
+  ): Promise<void> {
+    const startTime = performance.now();
+    const latency: LatencyStats = {
+      movingAvgMs: 0,
+      totalMs: 0,
+    };
+
+    const data: Record<string, string> = {};
+    for (let i = 0; i < fields.length; i += 2) {
+      data[fields[i]] = fields[i + 1];
+    }
+
+    const point: VelocityGPSPoint = {
+      sensorId: data.sensorId,
+      lat: parseFloat(data.lat),
+      lon: parseFloat(data.lon),
+      smoothedLat: parseFloat(data.smoothedLat),
+      smoothedLon: parseFloat(data.smoothedLon),
+      velocity: parseFloat(data.velocity),
+      timestamp: parseFloat(data.timestamp),
+    };
+
+    if (!point.sensorId || isNaN(point.velocity) || isNaN(point.timestamp)) {
+      console.warn(`⚠️  Invalid velocity point in message ${messageId}`, data);
+      await this.redis.xack(INPUT_STREAM, CONSUMER_GROUP, messageId);
+      return;
+    }
+
+    // Get or create state for this sensor
+    let state = this.states.get(point.sensorId);
+    if (!state) {
+      state = {
+        velocityBuffer: new Float32Array(VELOCITY_WINDOW_SIZE),
+        velocityIndex: 0,
+        lastTimestamp: 0,
+      };
+      this.states.set(point.sensorId, state);
+    }
+
+    // Update circular buffer
+    state.velocityBuffer[state.velocityIndex] = point.velocity;
+    state.velocityIndex = (state.velocityIndex + 1) % VELOCITY_WINDOW_SIZE;
+
+    // Calculate time delta
+    const dt =
+      state.lastTimestamp > 0
+        ? (point.timestamp - state.lastTimestamp) / 1000
+        : 0.1;
+
+    // Apply moving average
+    const movingAvgStart = performance.now();
+    const velocityArray = new Float32Array(state.velocityBuffer);
+    const velocityDeltas = new Float32Array(VELOCITY_WINDOW_SIZE).fill(dt);
+
+    const smoothedVelocityArray = await this.pipeline.process(
+      velocityArray,
+      velocityDeltas,
+      { channels: 1 }
+    );
+
+    const smoothedVelocity =
+      smoothedVelocityArray[smoothedVelocityArray.length - 1] || 0;
+    const isMoving = smoothedVelocity > MOVEMENT_THRESHOLD;
+    latency.movingAvgMs = performance.now() - movingAvgStart;
+
+    // Update state
+    state.lastTimestamp = point.timestamp;
+
+    // Prepare final result
+    const result = {
+      sensorId: point.sensorId,
+      lat: point.lat,
+      lon: point.lon,
+      smoothedLat: point.smoothedLat,
+      smoothedLon: point.smoothedLon,
+      velocity: point.velocity,
+      smoothedVelocity,
+      isMoving,
+      timestamp: point.timestamp,
+    };
+
+    // Publish to Redis pub/sub (for SSE server)
+    await this.redis.publish(OUTPUT_CHANNEL, JSON.stringify(result));
+
+    // Acknowledge message
+    await this.redis.xack(INPUT_STREAM, CONSUMER_GROUP, messageId);
+
+    // Track latency
+    latency.totalMs = performance.now() - startTime;
+    this.latencyStats.push(latency);
+    if (this.latencyStats.length >= LOG_BATCH_SIZE) {
+      this.flushLatencyLog(point.sensorId);
+    }
+
+    const status = isMoving ? "🚗 MOVING" : "🅿️  STOPPED";
+    console.log(
+      `✅ ${point.sensorId} | ${status} | v=${smoothedVelocity.toFixed(
+        2
+      )} m/s | ${latency.totalMs.toFixed(2)}ms`
+    );
+  }
+
+  private flushLatencyLog(sensorId?: string): void {
+    if (this.latencyStats.length === 0) return;
+
+    const avg = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
+
+    const movingAvgTimes = this.latencyStats.map((s) => s.movingAvgMs);
+    const totalTimes = this.latencyStats.map((s) => s.totalMs);
+
+    const timestamp = new Date().toISOString();
+    const logLine =
+      `${timestamp},${sensorId || "batch"},` +
+      `${avg(movingAvgTimes).toFixed(3)},${avg(totalTimes).toFixed(3)}\n`;
+
+    fs.appendFileSync(LOG_FILE, logLine);
+
+    console.log(
+      `📊 [Velocity Smoother] Latency (${this.latencyStats.length} samples): ` +
+        `MovingAvg=${avg(movingAvgTimes).toFixed(2)}ms, ` +
+        `Total=${avg(totalTimes).toFixed(2)}ms`
+    );
+
+    this.latencyStats = [];
+  }
+
+  async stop(): Promise<void> {
+    console.log("🛑 Stopping Velocity Smoother Worker...");
+    this.running = false;
+    await this.redis.quit();
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}
+
+// Main entry point
+const worker = new VelocitySmootherWorker();
+
+process.on("SIGINT", async () => {
+  await worker.stop();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  await worker.stop();
+  process.exit(0);
+});
+
+worker.start().catch((err) => {
+  console.error("💥 Fatal error:", err);
+  process.exit(1);
+});

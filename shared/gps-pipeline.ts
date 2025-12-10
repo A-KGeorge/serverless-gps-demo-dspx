@@ -87,8 +87,8 @@ export class GPSPipeline {
     this.positionPipeline = createDspPipeline();
     this.positionPipeline.KalmanFilter({
       dimensions: 2, // 2D tracking: lat, lon (library creates 4D state with velocity)
-      processNoise: 0.1, // Process noise in degrees (~0.0001 deg = ~11m change)
-      measurementNoise: 10, // GPS accuracy ~10m in degrees (~0.0001 deg)
+      processNoise: 0.0001, // Process noise in degrees (~0.0001 deg = ~11m change)
+      measurementNoise: 0.0001, // GPS accuracy ~10m in degrees (~0.0001 deg)
       initialError: 0.0001, // Initial position uncertainty in degrees
     });
 

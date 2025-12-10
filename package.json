@@ -4,8 +4,12 @@
   "description": "Real-time GPS trajectory smoothing with dspx and Kalman filtering",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"npm run dev:worker\" \"npm run dev:sse\" \"npm run dev:client\"",
+    "dev": "concurrently \"npm run dev:position\" \"npm run dev:velocity-calc\" \"npm run dev:velocity-smooth\" \"npm run dev:sse\" \"npm run dev:client\"",
+    "dev:monolith": "concurrently \"npm run dev:worker\" \"npm run dev:sse\" \"npm run dev:client\"",
     "dev:worker": "tsx watch worker/gps-worker.ts",
+    "dev:position": "tsx watch worker/position-smoother.ts",
+    "dev:velocity-calc": "tsx watch worker/velocity-calculator.ts",
+    "dev:velocity-smooth": "tsx watch worker/velocity-smoother.ts",
     "dev:sse": "tsx watch client/sse-server.ts",
     "dev:client": "vite",
     "replay": "tsx data/replay.ts",

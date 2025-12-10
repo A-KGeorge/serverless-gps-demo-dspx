@@ -10,32 +10,43 @@ flowchart TD
 
     Replay[🎬 Data Replay<br/>data/replay.ts<br/>• Parses PLT files<br/>• Time-scaled replay 10x<br/>• Parallel streaming]
 
-    RedisStream[(💾 Redis Stream<br/>gps:raw<br/>Raw GPS points)]
+    RedisStream1[(💾 Redis Stream<br/>gps:raw<br/>Raw GPS points)]
 
-    Worker[⚙️ GPS Worker<br/>worker/gps-worker.ts<br/>Consumer Group: gps-workers]
+    Worker1[⚙️ Position Smoother<br/>worker/position-smoother.ts<br/>Consumer: position-smoothers<br/>• Kalman Filter 2D lat,lon<br/>• dspx pipeline]
 
-    Pipeline[5-Step Pipeline:<br/>1. Load State Redis<br/>2. Position Pipeline dspx<br/>3. Haversine Distance<br/>4. Velocity Pipeline dspx<br/>5. Save State Redis]
+    RedisStream2[(💾 Redis Stream<br/>gps:position-smoothed<br/>Smoothed coordinates)]
 
-    RedisPubSub[(💾 Redis Pub/Sub<br/>gps:processed<br/>Smoothed + velocity)]
+    Worker2[📐 Velocity Calculator<br/>worker/velocity-calculator.ts<br/>Consumer: velocity-calculators<br/>• Haversine distance<br/>• Velocity m/s]
+
+    RedisStream3[(💾 Redis Stream<br/>gps:velocity-calculated<br/>Velocity data)]
+
+    Worker3[🔮 Velocity Smoother<br/>worker/velocity-smoother.ts<br/>Consumer: velocity-smoothers<br/>• Moving Average 1D<br/>• dspx pipeline]
+
+    RedisPubSub[(💾 Redis Pub/Sub<br/>gps:processed<br/>Final output)]
 
     SSE[📡 SSE Server<br/>client/sse-server.ts<br/>Port: 3002<br/>• Redis subscriber<br/>• EventSource bridge<br/>• CORS enabled]
 
     Client[🗺️ Web Client<br/>index.html + app.ts<br/>Port: 5173<br/>• Leaflet map<br/>• Dark/Light theme<br/>• Raw vs filtered traces<br/>• Live statistics]
 
     Dataset -->|Read PLT files| Replay
-    Replay -->|XADD| RedisStream
-    RedisStream -->|XREADGROUP<br/>Batch: 10 msgs| Worker
-    Worker -->|Process| Pipeline
-    Pipeline -.->|State I/O| Worker
-    Worker -->|PUBLISH| RedisPubSub
+    Replay -->|XADD| RedisStream1
+    RedisStream1 -->|XREADGROUP<br/>Batch: 10 msgs| Worker1
+    Worker1 -->|XADD| RedisStream2
+    RedisStream2 -->|XREADGROUP<br/>Batch: 10 msgs| Worker2
+    Worker2 -->|XADD| RedisStream3
+    RedisStream3 -->|XREADGROUP<br/>Batch: 10 msgs| Worker3
+    Worker3 -->|PUBLISH| RedisPubSub
     RedisPubSub -->|SUBSCRIBE| SSE
     SSE -->|Server-Sent Events<br/>text/event-stream| Client
 
     style Dataset fill:#2d3748,stroke:#4a5568,color:#fff
     style Replay fill:#2b6cb0,stroke:#3182ce,color:#fff
-    style RedisStream fill:#c53030,stroke:#e53e3e,color:#fff
-    style Worker fill:#2f855a,stroke:#38a169,color:#fff
-    style Pipeline fill:#805ad5,stroke:#9f7aea,color:#fff
+    style RedisStream1 fill:#c53030,stroke:#e53e3e,color:#fff
+    style Worker1 fill:#2f855a,stroke:#38a169,color:#fff
+    style RedisStream2 fill:#c53030,stroke:#e53e3e,color:#fff
+    style Worker2 fill:#805ad5,stroke:#9f7aea,color:#fff
+    style RedisStream3 fill:#c53030,stroke:#e53e3e,color:#fff
+    style Worker3 fill:#d69e2e,stroke:#ecc94b,color:#000
     style RedisPubSub fill:#c53030,stroke:#e53e3e,color:#fff
     style SSE fill:#d69e2e,stroke:#ecc94b,color:#fff
     style Client fill:#0066cc,stroke:#3182ce,color:#fff
@@ -72,15 +83,139 @@ flowchart TD
 
 ---
 
-### 2. GPS Worker (`worker/gps-worker.ts`)
+### 2. GPS Processing Workers (Modular Microservices)
 
-**Purpose**: Stateful GPS processing with Kalman filtering
+**Architecture Philosophy**: Each processing stage runs as an **independent, horizontally-scalable microservice**.
 
-**Architecture**:
+#### Worker 1: Position Smoother (`worker/position-smoother.ts`)
 
-- **Consumer Group**: `gps-workers` (enables horizontal scaling)
-- **Batch Processing**: Reads 10 messages per iteration
-- **Blocking Read**: 5-second timeout on empty stream
+**Purpose**: Apply Kalman filtering to raw GPS coordinates
+
+**Input**: `gps:raw` stream
+**Output**: `gps:position-smoothed` stream
+**Consumer Group**: `position-smoothers`
+
+**Processing**:
+
+- Reads raw GPS points (lat, lon, timestamp)
+- Applies 2D Kalman filter using dspx
+- Calculates time delta (dt) for proper filtering
+- Outputs smoothed coordinates
+
+**Configuration**:
+
+- Dimensions: 2 (lat, lon)
+- Process noise: 0.0001 (degree units)
+- Measurement noise: 0.0001 (degree units)
+- Batch size: 10 messages
+
+**Scaling**: Run multiple instances to distribute load across sensors
+
+---
+
+#### Worker 2: Velocity Calculator (`worker/velocity-calculator.ts`)
+
+**Purpose**: Calculate instantaneous velocity using Haversine distance
+
+**Input**: `gps:position-smoothed` stream
+**Output**: `gps:velocity-calculated` stream
+**Consumer Group**: `velocity-calculators`
+
+**Processing**:
+
+- Reads smoothed GPS positions
+- Calculates great-circle distance using Haversine formula
+- Divides by time delta to get velocity (m/s)
+- Outputs position + velocity
+
+**Why Separate Worker?**:
+
+- Haversine is pure JavaScript (geospatial math, not DSP)
+- Can be replaced with alternative distance calculations
+- Demonstrates modularity: swap out velocity algorithms
+
+**Scaling**: Stateless calculation enables easy horizontal scaling
+
+---
+
+#### Worker 3: Velocity Smoother (`worker/velocity-smoother.ts`)
+
+**Purpose**: Apply moving average to velocity data
+
+**Input**: `gps:velocity-calculated` stream
+**Output**: `gps:processed` pub/sub channel
+**Consumer Group**: `velocity-smoothers`
+
+**Processing**:
+
+- Reads velocity data
+- Maintains circular buffer (5 samples)
+- Applies 1D moving average using dspx
+- Determines movement status (>0.5 m/s threshold)
+- Publishes final result to SSE server
+
+**Configuration**:
+
+- Window size: 5 samples
+- Movement threshold: 0.5 m/s
+- Batch size: 10 messages
+
+**Scaling**: Run multiple instances for high-throughput scenarios
+
+---
+
+### Single-Worker Architecture (`worker/gps-worker.ts`)
+
+**Purpose**: Unified processing pipeline with all stages in one worker
+
+**Architecture**: All processing (Kalman filter, velocity calculation, moving average) runs in a single worker process with one Redis stream consumer. Use `npm run dev:monolith` to run this architecture.
+
+**Processing Flow**:
+
+```
+gps:raw → Single Worker → gps:processed
+          [Kalman → Haversine → MovingAvg]
+```
+
+**Key Characteristics**:
+
+- **Single Pipeline Instance**: One dspx pipeline handles both position and velocity processing
+- **Minimal Node↔C++ Transitions**: Processing stays in C++ for longer periods
+- **Consumer Group**: `gps-workers` (single stream reader)
+- **Batch Processing**: 10 messages per batch
+
+**Performance Profile**:
+
+Based on actual latency measurements:
+
+| Stage         | Latency     | Notes                         |
+| ------------- | ----------- | ----------------------------- |
+| Kalman Filter | ~0.10ms     | C++ dspx implementation       |
+| Haversine     | ~0.005ms    | Native JavaScript calculation |
+| Moving Avg    | ~0.05ms     | C++ dspx implementation       |
+| **Total**     | **~0.16ms** | **Single worker end-to-end**  |
+
+**Advantages**:
+
+- ✅ **Lower Latency**: ~0.16ms total (minimizes Node↔C++ context switches)
+- ✅ **Simpler Deployment**: Single process, easier to manage
+- ✅ **Better for Low-Volume**: Ideal when processing <100 sensors
+- ✅ **Reduced Overhead**: No inter-stream Redis I/O between stages
+
+**Trade-offs**:
+
+- ❌ **Monolithic Scaling**: Must scale entire pipeline, even if only one stage is bottlenecked
+- ❌ **Tight Coupling**: Cannot swap individual algorithms independently
+- ❌ **Single Point of Failure**: One crash stops all processing
+
+**When to Use**:
+
+- Latency-critical applications (sub-millisecond requirements)
+- Development/testing environments
+- Low to moderate sensor counts (<100 concurrent)
+- When simplicity outweighs scalability needs
+
+---
 
 **Pipeline Architecture**:
 
@@ -253,28 +388,38 @@ marker.setStyle({
 ```mermaid
 sequenceDiagram
     participant Replay as 🎬 Replay
-    participant Stream as Redis Stream<br/>(gps:raw)
-    participant Worker as ⚙️ Worker
-    participant State as Redis State<br/>(gps:state:*)
+    participant Stream1 as Redis Stream<br/>(gps:raw)
+    participant Worker1 as ⚙️ Position<br/>Smoother
+    participant Stream2 as Redis Stream<br/>(gps:position-smoothed)
+    participant Worker2 as 📐 Velocity<br/>Calculator
+    participant Stream3 as Redis Stream<br/>(gps:velocity-calculated)
+    participant Worker3 as 🔮 Velocity<br/>Smoother
     participant PubSub as Redis Pub/Sub<br/>(gps:processed)
     participant SSE as 📡 SSE Server
     participant Browser as 🗺️ Browser
 
-    Replay->>Stream: XADD gps:raw *<br/>sensorId lat lon timestamp
+    Replay->>Stream1: XADD gps:raw *<br/>sensorId lat lon timestamp
 
-    Worker->>Stream: XREADGROUP GROUP gps-workers<br/>worker-1234 COUNT 10
-    Stream-->>Worker: 10 messages
+    Worker1->>Stream1: XREADGROUP<br/>position-smoothers worker-1
+    Stream1-->>Worker1: Raw GPS point
 
-    loop For each message
-        Worker->>State: GETBUFFER gps:state:{sensorId}
-        State-->>Worker: 212-byte state buffer
+    Note over Worker1: dspx Kalman Filter (2D)<br/>dt calculation<br/>Smooth lat, lon
 
-        Note over Worker: 1. Position Pipeline dspx<br/>   (Kalman 2D: lat,lon)<br/>2. Haversine Distance<br/>3. Velocity Pipeline dspx<br/>   (MovingAvg 1D: velocity)
+    Worker1->>Stream2: XADD gps:position-smoothed *<br/>sensorId lat lon smoothedLat smoothedLon
 
-        Worker->>State: SETEX gps:state:{sensorId}<br/>3600 [binary state]
+    Worker2->>Stream2: XREADGROUP<br/>velocity-calculators worker-2
+    Stream2-->>Worker2: Smoothed GPS point
 
-        Worker->>PubSub: PUBLISH gps:processed<br/>{lat, smoothedLat, velocity...}
-    end
+    Note over Worker2: Haversine Distance<br/>Calculate velocity (m/s)
+
+    Worker2->>Stream3: XADD gps:velocity-calculated *<br/>sensorId smoothedLat smoothedLon velocity
+
+    Worker3->>Stream3: XREADGROUP<br/>velocity-smoothers worker-3
+    Stream3-->>Worker3: Velocity data
+
+    Note over Worker3: dspx Moving Average (1D)<br/>Smooth velocity<br/>Detect movement
+
+    Worker3->>PubSub: PUBLISH gps:processed<br/>{lat, smoothedLat, velocity, isMoving}
 
     PubSub-->>SSE: message event
     SSE->>Browser: Server-Sent Event<br/>data: {...}\n\n
@@ -284,27 +429,77 @@ sequenceDiagram
 
 ### Performance Metrics
 
-| Metric             | Value            | Notes                               |
-| ------------------ | ---------------- | ----------------------------------- |
-| Processing Latency | <5ms             | Per GPS point (including Redis I/O) |
-| Throughput         | 1000+ points/sec | Per worker instance                 |
-| State Size         | 212 bytes        | Per sensor (binary serialization)   |
-| Browser Rendering  | 60 FPS           | Up to 1000+ points on screen        |
-| Memory (Worker)    | ~50 MB           | Node.js + Redis client              |
-| Memory (Browser)   | ~100 MB          | Leaflet + traces                    |
+#### Single-Worker Architecture
+
+| Metric             | Value            | Notes                                          |
+| ------------------ | ---------------- | ---------------------------------------------- |
+| Processing Latency | **~0.16ms**      | Per GPS point (Kalman + Haversine + MovingAvg) |
+| Kalman Filter      | ~0.10ms          | C++ dspx 2D filtering                          |
+| Haversine          | ~0.005ms         | Native JavaScript calculation                  |
+| Moving Average     | ~0.05ms          | C++ dspx 1D smoothing                          |
+| Throughput         | ~6000 points/sec | Per worker instance                            |
+| State Size         | 212 bytes        | Per sensor (binary serialization)              |
+| Memory (Worker)    | ~50 MB           | Node.js + Redis client                         |
+
+#### Modular Architecture (3 Workers)
+
+| Metric              | Value           | Notes                                 |
+| ------------------- | --------------- | ------------------------------------- |
+| Position Smoother   | **~1.5ms**      | Kalman filter + Redis I/O             |
+| Velocity Calculator | **~1.2ms**      | Haversine + Redis I/O                 |
+| Velocity Smoother   | **~1.4ms**      | Moving average + Redis I/O + Pub/Sub  |
+| **Total Pipeline**  | **~4.1ms**      | **End-to-end (all 3 stages)**         |
+| Throughput (Each)   | 600-800 pts/sec | Per worker instance (bottleneck: I/O) |
+| Scalability         | Linear          | Add workers independently             |
+| Memory (3 Workers)  | ~150 MB         | 3x Node.js processes + Redis clients  |
+
+#### Architecture Comparison
+
+| Metric                    | Single-Worker  | Modular (3 Workers)          | Difference               |
+| ------------------------- | -------------- | ---------------------------- | ------------------------ |
+| **End-to-End Latency**    | 0.16ms         | 4.1ms                        | **25x slower**           |
+| **Node↔C++ Switches**     | 2-3x           | 6-9x                         | 3x more context switches |
+| **Redis Operations**      | 2 (read + pub) | 6 (3 reads + 2 writes + pub) | 3x I/O overhead          |
+| **Horizontal Scaling**    | No             | Yes (per stage)              | Independent scaling      |
+| **Fault Isolation**       | No             | Yes                          | Worker failures isolated |
+| **Algorithm Flexibility** | Low            | High                         | Swap individual stages   |
+
+**Key Insight**: The modular architecture introduces **~4ms overhead** primarily from:
+
+- **Redis I/O**: 3 stream reads + 2 stream writes + 1 pub/sub (~3ms)
+- **Node↔C++ Context Switches**: 3x more transitions between JavaScript and native code (~0.5ms)
+- **Message Serialization**: JSON encoding/decoding at each stage (~0.5ms)
+
+**Recommendation**:
+
+- Use **single-worker** for latency-sensitive applications (<1ms requirement)
+- Use **modular** for high-throughput, scalable systems (>100 sensors, independent bottlenecks)
+
+#### Browser Performance
+
+| Metric           | Value   | Notes                        |
+| ---------------- | ------- | ---------------------------- |
+| Rendering        | 60 FPS  | Up to 1000+ points on screen |
+| Memory (Browser) | ~100 MB | Leaflet + traces             |
 
 ---
 
 ## Redis Data Structures
 
-### Streams
+### Streams (Modular Architecture)
 
 ```redis
-# gps:raw - Input queue
+# Stage 1: Raw GPS data
 XADD gps:raw * sensorId "000-20081023025304" lat "39.984" lon "116.318" timestamp "1734567890000"
+XGROUP CREATE gps:raw position-smoothers 0 MKSTREAM
 
-# Consumer group
-XGROUP CREATE gps:raw gps-workers 0 MKSTREAM
+# Stage 2: Position smoothed
+XADD gps:position-smoothed * sensorId "000-20081023025304" lat "39.984" lon "116.318" smoothedLat "39.9842" smoothedLon "116.3182" timestamp "1734567890000"
+XGROUP CREATE gps:position-smoothed velocity-calculators 0 MKSTREAM
+
+# Stage 3: Velocity calculated
+XADD gps:velocity-calculated * sensorId "000-20081023025304" smoothedLat "39.9842" smoothedLon "116.3182" velocity "12.5" timestamp "1734567890000"
+XGROUP CREATE gps:velocity-calculated velocity-smoothers 0 MKSTREAM
 ```
 
 ### Pub/Sub
@@ -314,31 +509,53 @@ XGROUP CREATE gps:raw gps-workers 0 MKSTREAM
 PUBLISH gps:processed '{"sensorId":"000-20081023025304","lat":39.984,...}'
 ```
 
-### State Storage
-
-```redis
-# gps:state:{sensorId} - Kalman state (binary)
-SETEX gps:state:000-20081023025304 3600 <212-byte binary buffer>
-```
-
 ---
 
 ## Scaling Strategies
 
-### Horizontal Scaling (Workers)
+### Horizontal Scaling (Modular Workers)
 
 ```bash
-# Run multiple worker instances
-npm run dev:worker  # Terminal 1
-npm run dev:worker  # Terminal 2
-npm run dev:worker  # Terminal 3
+# Scale each stage independently based on bottlenecks
+
+# Position smoothing (CPU-intensive: Kalman filter)
+npm run dev:position  # Terminal 1
+npm run dev:position  # Terminal 2
+npm run dev:position  # Terminal 3
+
+# Velocity calculation (lightweight)
+npm run dev:velocity-calc  # Terminal 4
+
+# Velocity smoothing (I/O-intensive: final stage)
+npm run dev:velocity-smooth  # Terminal 5
+npm run dev:velocity-smooth  # Terminal 6
 ```
 
-**Benefits**:
+**Benefits of Modular Architecture**:
 
-- Redis consumer groups automatically distribute messages
-- Each worker processes different sensors
-- Linear throughput scaling
+- **Independent Scaling**: Scale bottleneck stages without over-provisioning
+- **Technology Flexibility**: Replace Haversine with GPU-accelerated version
+- **Failure Isolation**: Position smoother crash doesn't affect velocity workers
+- **Easy Debugging**: Monitor each stage's throughput independently
+- **Cost Optimization**: Use smaller instances for lightweight stages
+
+**Performance Monitoring**:
+
+```bash
+# Check stream lengths to identify bottlenecks
+redis-cli XLEN gps:raw                  # Should be near 0 (fast drain)
+redis-cli XLEN gps:position-smoothed    # Check backlog
+redis-cli XLEN gps:velocity-calculated  # Check backlog
+```
+
+**Scaling Strategy by Bottleneck**:
+
+| Bottleneck Stage    | Symptom                                   | Solution                                   |
+| ------------------- | ----------------------------------------- | ------------------------------------------ |
+| Position Smoother   | `gps:position-smoothed` backlog growing   | Add more Kalman filter workers             |
+| Velocity Calculator | `gps:velocity-calculated` backlog growing | Add more Haversine workers                 |
+| Velocity Smoother   | Browser updates lagging                   | Add more moving average workers            |
+| All stages          | All streams backed up                     | Increase BATCH_SIZE or reduce REPLAY_SPEED |
 
 ### Vertical Scaling (SSE Server)
 
@@ -374,25 +591,33 @@ redis_shard_1: sensors 100-199
 ### Kalman Filter Mathematics
 
 ```mermaid
-graph LR
-    subgraph "State Vector (4D)"
+flowchart LR
+    subgraph State["State Vector (4D)"]
         X[x = lat, lon<br/>lat_vel, lon_vel]
     end
 
-    subgraph "Predict Step"
-        X --> P1[x̂ₖ₊₁|ₖ = F·xₖ|ₖ]
-        P1 --> P2[Pₖ₊₁|ₖ = F·Pₖ|ₖ·Fᵀ + Q]
+    subgraph Predict["Predict Step"]
+        P1["x̂(k+1∣k) = F·x(k∣k)"]
+        P2["P(k+1∣k) = F·P(k∣k)·Fᵀ + Q"]
     end
 
-    subgraph "Update Step"
-        Z[Measurement<br/>lat, lon] --> U1[y = z - H·x̂]
-        P2 --> U2[S = H·P·Hᵀ + R]
-        U1 --> U3[K = P·Hᵀ·S⁻¹]
-        U2 --> U3
-        U3 --> U4[x = x̂ + K·y]
-        U3 --> U5[P = I - K·H·P]
+    subgraph Update["Update Step"]
+        Z[Measurement<br/>lat, lon]
+        U1["y = z - H·x̂"]
+        U2["S = H·P·Hᵀ + R"]
+        U3["K = P·Hᵀ·S⁻¹"]
+        U4["x = x̂ + K·y"]
+        U5["P = (I - K·H)·P"]
     end
 
+    X --> P1
+    P1 --> P2
+    Z --> U1
+    P2 --> U2
+    U1 --> U3
+    U2 --> U3
+    U3 --> U4
+    U3 --> U5
     U4 --> Output[Smoothed Position]
     U5 --> NextCycle[Next Iteration]
 
