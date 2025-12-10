@@ -134,7 +134,3 @@ gps-demo/
 - Fitness tracking
 - Asset monitoring
 - Fleet management
-
-## License
-
-MIT
