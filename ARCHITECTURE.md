@@ -14,7 +14,7 @@ flowchart TD
 
     Worker[⚙️ GPS Worker<br/>worker/gps-worker.ts<br/>Consumer Group: gps-workers]
 
-    Pipeline[5-Step Pipeline:<br/>1. Load State Redis<br/>2. dspx Kalman Filter 2D<br/>3. Haversine Distance<br/>4. dspx Moving Average<br/>5. Save State Redis]
+    Pipeline[5-Step Pipeline:<br/>1. Load State Redis<br/>2. Position Pipeline dspx<br/>3. Haversine Distance<br/>4. Velocity Pipeline dspx<br/>5. Save State Redis]
 
     RedisPubSub[(💾 Redis Pub/Sub<br/>gps:processed<br/>Smoothed + velocity)]
 
@@ -82,6 +82,34 @@ flowchart TD
 - **Batch Processing**: Reads 10 messages per iteration
 - **Blocking Read**: 5-second timeout on empty stream
 
+**Pipeline Architecture**:
+
+The GPS processing system uses **two separate dspx pipelines** for optimal performance:
+
+1. **Position Pipeline** (`positionPipeline`)
+
+   - Stage: `KalmanFilter` (2D: lat, lon)
+   - Input: Raw GPS coordinates
+   - Output: Smoothed position
+   - Channel count: 2 (interleaved lat, lon)
+
+2. **Velocity Pipeline** (`velocityPipeline`)
+   - Stage: `MovingAverage` (1D)
+   - Input: Instantaneous velocity values
+   - Output: Smoothed velocity
+   - Channel count: 1
+
+**Why Two Pipelines?**
+
+Separate pipelines are necessary because:
+
+- The Kalman filter requires 2 dimensions (lat, lon) matching its configuration
+- The moving average operates on 1-dimensional velocity data
+- dspx validates that channel count matches stage requirements
+- Each pipeline maintains its own internal state optimized for its data type
+
+This architecture provides better performance than a unified pipeline while maintaining clean separation of concerns.
+
 **Pipeline Steps**:
 
 #### Step 1: Load State
@@ -98,14 +126,21 @@ flowchart TD
 }
 ```
 
-#### Step 2: Kalman Filter (dspx)
+#### Step 2: Position Pipeline (dspx Kalman Filter)
 
+- **Pipeline**: `positionPipeline` (dedicated for 2D position)
 - **Implementation**: Built-in dspx KalmanFilter stage
-- **Dimensions**: 2 (lat, lon tracking)
-- **Process noise**: 0.1 (smooth motion assumption)
-- **Measurement noise**: 10.0 (GPS ±10m accuracy)
-- **Initial error**: 1.0 (initial position uncertainty)
-- **Operations**: Processes interleaved [lat, lon] with timestamps
+- **Dimensions**: 2 (lat, lon tracking - library auto-creates 4D state with velocity)
+- **Process noise**: 0.0001 (degrees² - process variance for position changes)
+- **Measurement noise**: 0.0001 (degrees² - GPS uncertainty in degree units)
+- **Initial error**: 0.0001 (degrees² - initial position uncertainty)
+- **Input format**: Interleaved Float32Array `[lat, lon]` with **time deltas** `[dt, dt]`
+- **CRITICAL**: Must pass time **delta** (seconds elapsed since last point), NOT absolute timestamps
+  - ✅ Correct: `dt = (currentTime - lastTime) / 1000` (e.g., 0.5 seconds)
+  - ❌ Wrong: `timestamp = currentTime / 1000` (e.g., 1739824567 seconds)
+  - Why: C++ implementation uses input directly in state transition matrix F
+- **Operations**: Processes 2-channel position data through Kalman filter
+- **Output**: Smoothed `[lat, lon]` coordinates
 
 #### Step 3: Velocity Calculation
 
@@ -115,14 +150,17 @@ flowchart TD
 - **Output**: Instantaneous velocity (m/s)
 - **Note**: Uses native JS (not dspx) since it's geospatial math, not signal processing
 
-#### Step 4: Moving Average (dspx)
+#### Step 4: Velocity Pipeline (dspx Moving Average)
 
+- **Pipeline**: `velocityPipeline` (dedicated for 1D velocity)
 - **Implementation**: Built-in dspx MovingAverage stage
 - **Mode**: moving (stateful across calls)
 - **Window**: 5 samples (circular buffer)
-- **Timestamps**: Passed with velocity data for time-aware processing
+- **Input format**: Float32Array of velocity buffer with time deltas
+- **Time deltas**: Same dt value used for each velocity sample (uniform sampling)
+- **Operations**: Processes 1-channel velocity data through moving average
 - **Purpose**: Smooth velocity to reduce jitter
-- **Output**: Smoothed velocity for movement detection
+- **Output**: Smoothed velocity scalar for movement detection
 
 #### Step 5: Save State
 
@@ -231,7 +269,7 @@ sequenceDiagram
         Worker->>State: GETBUFFER gps:state:{sensorId}
         State-->>Worker: 212-byte state buffer
 
-        Note over Worker: 1. dspx Kalman (2D)<br/>2. Haversine Distance<br/>3. dspx Moving Avg
+        Note over Worker: 1. Position Pipeline dspx<br/>   (Kalman 2D: lat,lon)<br/>2. Haversine Distance<br/>3. Velocity Pipeline dspx<br/>   (MovingAvg 1D: velocity)
 
         Worker->>State: SETEX gps:state:{sensorId}<br/>3600 [binary state]
 
@@ -409,6 +447,66 @@ x = x̂ + K·y      (updated state)
 P = (I - K·H)·P  (updated covariance)
 ```
 
+### Two-Pipeline Architecture
+
+```typescript
+// Initialize two separate pipelines in constructor
+class GPSPipeline {
+  private positionPipeline: ReturnType<typeof createDspPipeline>;
+  private velocityPipeline: ReturnType<typeof createDspPipeline>;
+
+  constructor() {
+    // Position pipeline: Kalman filter for 2D coordinates
+    this.positionPipeline = createDspPipeline();
+    this.positionPipeline.KalmanFilter({
+      dimensions: 2, // 2D: lat, lon
+      processNoise: 1e-4, // Very smooth (0.0001)
+      measurementNoise: 1e-7, // High trust in GPS (0.0000001)
+      initialError: 1.0,
+    });
+
+    // Velocity pipeline: Moving average for 1D velocity
+    this.velocityPipeline = createDspPipeline();
+    this.velocityPipeline.MovingAverage({
+      mode: "moving",
+      windowSize: 5,
+    });
+  }
+
+  async process(point: GPSPoint, state: KalmanState) {
+    // Process position through 2-channel pipeline
+    const measurement = new Float32Array([point.lat, point.lon]);
+
+    // CRITICAL: Calculate time delta (dt), not absolute timestamp
+    const dt =
+      state.lastTimestamp > 0
+        ? (point.timestamp - state.lastTimestamp) / 1000
+        : 0.1; // Default to 0.1s for first point
+    const positionDeltas = new Float32Array([dt, dt]);
+
+    const smoothedPosition = await this.positionPipeline.process(
+      measurement,
+      positionDeltas, // Time deltas, not timestamps!
+      { channels: 2 } // 2-channel input for lat, lon
+    );
+
+    // Calculate velocity using Haversine distance
+    const velocity = calculateVelocity(state, smoothedPosition);
+
+    // Process velocity through 1-channel pipeline
+    const velocityArray = new Float32Array(state.velocityBuffer);
+    const velocityDeltas = new Float32Array(5).fill(dt); // Uniform time steps
+    const smoothedVelocity = await this.velocityPipeline.process(
+      velocityArray,
+      velocityDeltas,
+      { channels: 1 } // 1-channel input for velocity
+    );
+
+    return { smoothedPosition, smoothedVelocity };
+  }
+}
+```
+
 ### Haversine Distance
 
 ```typescript
@@ -447,22 +545,37 @@ BLOCK_MS=5000          # Read timeout (ms)
 REPLAY_SPEED=10        # Time multiplier (1=real-time)
 NUM_TRAJECTORIES=3     # Trajectories to load
 
-# Kalman filter (edit shared/kalman-filter.ts)
-PROCESS_NOISE=0.1      # Lower = smoother, slower adaptation
-MEASUREMENT_NOISE=10.0 # GPS accuracy (meters)
+# Kalman filter (edit shared/gps-pipeline.ts constructor)
+PROCESS_NOISE=0.0001     # Process variance in degrees
+MEASUREMENT_NOISE=0.0001 # GPS variance in degrees (~10m)
+INITIAL_ERROR=0.0001     # Initial uncertainty in degrees
 ```
 
 ### Tuning Guidelines
 
-**For noisy GPS (urban canyons)**:
+**Understanding the Scale**:
 
-- Increase `measurementNoise` in KalmanFilter config (e.g., 20.0)
-- Decrease `processNoise` (e.g., 0.05)
+- Input coordinates are in **degrees** (lat/lon)
+- ~0.0001 degrees ≈ 11 meters at the equator
+- All noise parameters must be in **degree units**, not meters
 
-**For smooth highways**:
+**Current configuration** (balanced smoothing):
 
-- Decrease `measurementNoise` (e.g., 5.0)
-- Increase `processNoise` (e.g., 0.2)
+- `processNoise: 0.0001` - Process variance (how much position changes per timestep)
+- `measurementNoise: 0.0001` - GPS sensor variance (~10m accuracy in degrees)
+- `initialError: 0.0001` - Initial position uncertainty
+
+**For more aggressive smoothing**:
+
+- Decrease `processNoise` (e.g., 0.00001) - assume very smooth motion
+- Keep `measurementNoise` same or increase (trust GPS less)
+
+**For more responsive tracking**:
+
+- Increase `processNoise` (e.g., 0.001) - allow faster position changes
+- Decrease `measurementNoise` (e.g., 0.00005) - trust GPS more
+
+**CRITICAL REMINDER**: Always pass **time deltas (dt)**, not absolute timestamps!
 
 **Note**: Edit `shared/gps-pipeline.ts` constructor to change these values
 

@@ -86,10 +86,10 @@ export class GPSPipeline {
     // Initialize position pipeline with Kalman filter (2D: lat, lon)
     this.positionPipeline = createDspPipeline();
     this.positionPipeline.KalmanFilter({
-      dimensions: 2, // 2D tracking: lat, lon
-      processNoise: 0.1, // Low process noise (smooth motion)
-      measurementNoise: 10.0, // GPS accuracy ~10m
-      initialError: 1.0, // Initial position uncertainty
+      dimensions: 2, // 2D tracking: lat, lon (library creates 4D state with velocity)
+      processNoise: 0.1, // Process noise in degrees (~0.0001 deg = ~11m change)
+      measurementNoise: 10, // GPS accuracy ~10m in degrees (~0.0001 deg)
+      initialError: 0.0001, // Initial position uncertainty in degrees
     });
 
     // Initialize velocity pipeline with moving average (1D)
@@ -137,13 +137,19 @@ export class GPSPipeline {
 
     // Prepare Kalman input: interleaved [lat, lon]
     const measurement = new Float32Array([point.lat, point.lon]);
-    const timestampSec = point.timestamp / 1000;
-    const positionTimestamps = new Float32Array([timestampSec, timestampSec]);
+
+    // Calculate time delta (dt) in seconds since last point
+    // CRITICAL: dspx expects dt (elapsed time), not absolute timestamps
+    const dt =
+      state.lastTimestamp > 0
+        ? (point.timestamp - state.lastTimestamp) / 1000
+        : 0.1; // Default to 0.1s for first point
+    const positionDeltas = new Float32Array([dt, dt]);
 
     // Process through Kalman filter
     const smoothedPosition = await this.positionPipeline.process(
       measurement,
-      positionTimestamps,
+      positionDeltas,
       { channels: 2 }
     );
 
@@ -161,7 +167,7 @@ export class GPSPipeline {
       smoothedLat,
       smoothedLon // Current position
     );
-    const dt = (point.timestamp - state.lastTimestamp) / 1000;
+    // dt already calculated above, reuse it
     const instantVelocity = dt > 0 ? distance / dt : 0;
     latency.differentiatorMs = performance.now() - diffStart;
 
@@ -172,17 +178,14 @@ export class GPSPipeline {
     state.velocityBuffer[state.velocityIndex] = instantVelocity;
     state.velocityIndex = (state.velocityIndex + 1) % VELOCITY_WINDOW_SIZE;
 
-    // Prepare velocity array with timestamps
+    // Prepare velocity array with time deltas
     const velocityArray = new Float32Array(state.velocityBuffer);
-    const velocityTimestamps = new Float32Array(VELOCITY_WINDOW_SIZE);
-    const currentTime = point.timestamp / 1000;
-    for (let i = 0; i < VELOCITY_WINDOW_SIZE; i++) {
-      velocityTimestamps[i] = currentTime - (VELOCITY_WINDOW_SIZE - 1 - i);
-    }
+    // Use same dt for all velocity samples (uniform sampling assumption)
+    const velocityDeltas = new Float32Array(VELOCITY_WINDOW_SIZE).fill(dt);
 
     // Process velocity through moving average
     const smoothedVelocityArray = await this.velocityPipeline
-      .process(velocityArray, velocityTimestamps, { channels: 1 })
+      .process(velocityArray, velocityDeltas, { channels: 1 })
       .then((result) => result[result.length - 1] || 0);
 
     latency.dspPipelineMs = performance.now() - velocityStart;
