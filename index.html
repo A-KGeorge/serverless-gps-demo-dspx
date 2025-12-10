@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GPS Trajectory Smoothing - dspx Demo</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          sans-serif;
+        background: #1a1a1a;
+        color: #fff;
+      }
+
+      #app {
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+
+      header {
+        background: #2a2a2a;
+        padding: 1rem 2rem;
+        border-bottom: 2px solid #3a3a3a;
+      }
+
+      h1 {
+        font-size: 1.5rem;
+        font-weight: 600;
+        margin-bottom: 0.5rem;
+      }
+
+      .subtitle {
+        color: #888;
+        font-size: 0.875rem;
+      }
+
+      .controls {
+        background: #2a2a2a;
+        padding: 1rem 2rem;
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+        border-bottom: 1px solid #3a3a3a;
+        flex-wrap: wrap;
+      }
+
+      .control-group {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+
+      label {
+        font-size: 0.875rem;
+        color: #aaa;
+      }
+
+      input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        cursor: pointer;
+      }
+
+      select,
+      input[type="number"] {
+        background: #1a1a1a;
+        color: #fff;
+        border: 1px solid #444;
+        padding: 0.5rem;
+        border-radius: 4px;
+        font-size: 0.875rem;
+      }
+
+      button {
+        background: #0066cc;
+        color: #fff;
+        border: none;
+        padding: 0.5rem 1rem;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 0.875rem;
+        font-weight: 500;
+        transition: background 0.2s;
+      }
+
+      button:hover {
+        background: #0052a3;
+      }
+
+      button.danger {
+        background: #cc3333;
+      }
+
+      button.danger:hover {
+        background: #aa2222;
+      }
+
+      button:disabled {
+        background: #444;
+        cursor: not-allowed;
+      }
+
+      .stats {
+        display: flex;
+        gap: 2rem;
+        font-size: 0.875rem;
+      }
+
+      .stat {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .stat-label {
+        color: #888;
+        font-size: 0.75rem;
+      }
+
+      .stat-value {
+        font-weight: 600;
+        font-size: 1rem;
+        margin-top: 0.25rem;
+      }
+
+      #map {
+        flex: 1;
+        background: #0a0a0a;
+      }
+
+      .leaflet-container {
+        background: #0a0a0a !important;
+      }
+
+      /* Light mode styles */
+      body.light-mode {
+        background: #f5f5f5;
+        color: #333;
+      }
+
+      body.light-mode header,
+      body.light-mode .controls {
+        background: #ffffff;
+        border-bottom-color: #e0e0e0;
+      }
+
+      body.light-mode .subtitle,
+      body.light-mode label,
+      body.light-mode .stat-label {
+        color: #666;
+      }
+
+      body.light-mode select,
+      body.light-mode input[type="number"] {
+        background: #f5f5f5;
+        color: #333;
+        border-color: #ccc;
+      }
+
+      body.light-mode .legend {
+        background: rgba(255, 255, 255, 0.95);
+        border-color: #ccc;
+      }
+
+      body.light-mode #map {
+        background: #f5f5f5;
+      }
+
+      body.light-mode .leaflet-container {
+        background: #f5f5f5 !important;
+      }
+
+      .status-indicator {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        margin-right: 0.5rem;
+      }
+
+      .status-indicator.connected {
+        background: #33cc33;
+        box-shadow: 0 0 8px #33cc33;
+      }
+
+      .status-indicator.disconnected {
+        background: #cc3333;
+      }
+
+      .legend {
+        position: absolute;
+        bottom: 2rem;
+        right: 2rem;
+        background: rgba(42, 42, 42, 0.95);
+        padding: 1rem;
+        border-radius: 8px;
+        border: 1px solid #444;
+        z-index: 1000;
+      }
+
+      .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 0.5rem;
+        font-size: 0.875rem;
+      }
+
+      .legend-item:last-child {
+        margin-bottom: 0;
+      }
+
+      .legend-line {
+        width: 24px;
+        height: 3px;
+        border-radius: 2px;
+      }
+
+      .legend-line.raw {
+        background: #cc3333;
+      }
+
+      .legend-line.filtered {
+        background: #33cc33;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>🛰️ GPS Trajectory Smoothing Demo</h1>
+        <p class="subtitle">Real-time Kalman filtering with dspx</p>
+      </header>
+
+      <div class="controls">
+        <div class="control-group">
+          <span class="status-indicator" id="status"></span>
+          <span id="status-text">Connecting...</span>
+        </div>
+
+        <div class="control-group">
+          <label>
+            <input type="checkbox" id="show-raw" checked />
+            Show Raw Trace
+          </label>
+        </div>
+
+        <div class="control-group">
+          <label>
+            <input type="checkbox" id="show-filtered" checked />
+            Show Filtered Trace
+          </label>
+        </div>
+
+        <div class="control-group">
+          <button id="theme-toggle">🌙 Dark Mode</button>
+        </div>
+
+        <div class="control-group">
+          <label for="sensor-select">Sensor:</label>
+          <select id="sensor-select">
+            <option value="">All Sensors</option>
+          </select>
+        </div>
+
+        <button id="clear-btn">Clear Map</button>
+
+        <div class="stats">
+          <div class="stat">
+            <span class="stat-label">Points Processed</span>
+            <span class="stat-value" id="points-count">0</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Avg Velocity</span>
+            <span class="stat-value" id="avg-velocity">0.0 m/s</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Status</span>
+            <span class="stat-value" id="movement-status">—</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="map"></div>
+
+      <div class="legend">
+        <div class="legend-item">
+          <div class="legend-line raw"></div>
+          <span>Raw GPS</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-line filtered"></div>
+          <span>Kalman Filtered</span>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script type="module" src="/client/app.ts"></script>
+  </body>
+</html>
