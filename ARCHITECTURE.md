@@ -172,9 +172,36 @@ flowchart TD
 
 **Processing Flow**:
 
-```
-gps:raw → Single Worker → gps:processed
-          [Kalman → Haversine → MovingAvg]
+```mermaid
+flowchart TD
+    Dataset[📦 Geolife Dataset<br/>./archive/<br/>182 users, ~18k trajectories]
+
+    Replay[🎬 Data Replay<br/>data/replay.ts<br/>• Parses PLT files<br/>• Time-scaled replay 10x<br/>• Parallel streaming]
+
+    RedisStream[(💾 Redis Stream<br/>gps:raw<br/>Raw GPS points)]
+
+    Worker[⚙️ Single Worker<br/>worker/gps-worker.ts<br/>Consumer: gps-workers<br/>• Kalman Filter 2D<br/>• Haversine Distance<br/>• Moving Average 1D<br/>• All in one process]
+
+    RedisPubSub[(💾 Redis Pub/Sub<br/>gps:processed<br/>Final output)]
+
+    SSE[📡 SSE Server<br/>client/sse-server.ts<br/>Port: 3002<br/>• Redis subscriber<br/>• EventSource bridge<br/>• CORS enabled]
+
+    Client[🗺️ Web Client<br/>index.html + app.ts<br/>Port: 5173<br/>• Leaflet map<br/>• Dark/Light theme<br/>• Raw vs filtered traces<br/>• Live statistics]
+
+    Dataset -->|Read PLT files| Replay
+    Replay -->|XADD| RedisStream
+    RedisStream -->|XREADGROUP<br/>Batch: 10 msgs| Worker
+    Worker -->|PUBLISH| RedisPubSub
+    RedisPubSub -->|SUBSCRIBE| SSE
+    SSE -->|Server-Sent Events<br/>text/event-stream| Client
+
+    style Dataset fill:#2d3748,stroke:#4a5568,color:#fff
+    style Replay fill:#2b6cb0,stroke:#3182ce,color:#fff
+    style RedisStream fill:#c53030,stroke:#e53e3e,color:#fff
+    style Worker fill:#2f855a,stroke:#38a169,color:#fff
+    style RedisPubSub fill:#c53030,stroke:#e53e3e,color:#fff
+    style SSE fill:#d69e2e,stroke:#ecc94b,color:#fff
+    style Client fill:#0066cc,stroke:#3182ce,color:#fff
 ```
 
 **Key Characteristics**:
@@ -591,23 +618,23 @@ redis_shard_1: sensors 100-199
 ### Kalman Filter Mathematics
 
 ```mermaid
-flowchart LR
-    subgraph State["State Vector (4D)"]
-        X[x = lat, lon<br/>lat_vel, lon_vel]
+flowchart TB
+    subgraph State["State Vector - 4D"]
+        X["x = [lat, lon, lat_vel, lon_vel]ᵀ"]
     end
 
     subgraph Predict["Predict Step"]
-        P1["x̂(k+1∣k) = F·x(k∣k)"]
-        P2["P(k+1∣k) = F·P(k∣k)·Fᵀ + Q"]
+        P1["Predicted State<br/>x̂ = F × x"]
+        P2["Predicted Covariance<br/>P = F × P × Fᵀ + Q"]
     end
 
     subgraph Update["Update Step"]
-        Z[Measurement<br/>lat, lon]
-        U1["y = z - H·x̂"]
-        U2["S = H·P·Hᵀ + R"]
-        U3["K = P·Hᵀ·S⁻¹"]
-        U4["x = x̂ + K·y"]
-        U5["P = (I - K·H)·P"]
+        Z["Measurement<br/>[lat, lon]"]
+        U1["Innovation<br/>y = z - H × x̂"]
+        U2["Innovation Covariance<br/>S = H × P × Hᵀ + R"]
+        U3["Kalman Gain<br/>K = P × Hᵀ × S⁻¹"]
+        U4["Updated State<br/>x = x̂ + K × y"]
+        U5["Updated Covariance<br/>P = (I - K × H) × P"]
     end
 
     X --> P1
@@ -618,7 +645,7 @@ flowchart LR
     U2 --> U3
     U3 --> U4
     U3 --> U5
-    U4 --> Output[Smoothed Position]
+    U4 --> Output["Smoothed Position<br/>[lat, lon]"]
     U5 --> NextCycle[Next Iteration]
 
     style X fill:#805ad5,stroke:#9f7aea,color:#fff
