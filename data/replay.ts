@@ -17,6 +17,7 @@ const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
 const INPUT_STREAM = "gps:raw";
 const ARCHIVE_DIR = path.join(__dirname, "../archive");
 const REPLAY_SPEED = parseFloat(process.env.REPLAY_SPEED || "10"); // 10x real-time
+const BATCH_SIZE = 10; // Process N trajectories at a time to avoid memory overflow
 
 // Parse command-line arguments
 const args = process.argv.slice(2);
@@ -28,8 +29,11 @@ for (let i = 0; i < args.length; i++) {
   if (args[i] === "--users" || args[i] === "-u") {
     i++;
     while (i < args.length && !args[i].startsWith("-")) {
-      // Split comma-separated values
-      const ids = args[i].split(",").map((id) => id.trim());
+      // Split comma-separated values and spaces
+      const ids = args[i]
+        .split(/[,\s]+/)
+        .map((id) => id.trim())
+        .filter((id) => id);
       USER_IDS.push(...ids);
       i++;
     }
@@ -37,26 +41,37 @@ for (let i = 0; i < args.length; i++) {
   } else if (args[i] === "--sensors" || args[i] === "-s") {
     i++;
     while (i < args.length && !args[i].startsWith("-")) {
-      // Split comma-separated values
-      const ids = args[i].split(",").map((id) => id.trim());
+      // Split comma-separated values and spaces
+      const ids = args[i]
+        .split(/[,\s]+/)
+        .map((id) => id.trim())
+        .filter((id) => id);
       SENSOR_IDS.push(...ids);
       i++;
     }
     i--; // Back up one since loop will increment
   } else if (!args[i].startsWith("-")) {
     // Auto-detect: 3 digits = user ID, 14 digits = sensor ID
-    const id = args[i].trim();
-    if (/^\d{3}$/.test(id)) {
-      USER_IDS.push(id);
-    } else if (/^\d{14}$/.test(id)) {
-      SENSOR_IDS.push(id);
-    } else {
-      console.warn(
-        `⚠️  Unknown argument format: ${id} (expected 3-digit user ID or 14-digit sensor ID)`
-      );
+    // Also handle space-separated values within a single argument
+    const ids = args[i].split(/[,\s]+/).filter((id) => id.trim());
+    for (const id of ids) {
+      const trimmedId = id.trim();
+      if (/^\d{3}$/.test(trimmedId)) {
+        USER_IDS.push(trimmedId);
+      } else if (/^\d{14}$/.test(trimmedId)) {
+        SENSOR_IDS.push(trimmedId);
+      } else {
+        console.warn(
+          `⚠️  Unknown argument format: ${trimmedId} (expected 3-digit user ID or 14-digit sensor ID)`
+        );
+      }
     }
   }
 }
+
+// Debug output
+console.log(`🔍 Parsed USER_IDS: [${USER_IDS.join(", ")}]`);
+console.log(`🔍 Parsed SENSOR_IDS: [${SENSOR_IDS.join(", ")}]\n`);
 
 interface GPSPoint {
   lat: number;
@@ -70,6 +85,13 @@ interface Trajectory {
   userId: string;
   trajectoryId: string;
   points: GPSPoint[];
+}
+
+interface TrajectoryFile {
+  userId: string;
+  trajectoryId: string;
+  filePath: string;
+  pointCount: number;
 }
 
 /**
@@ -108,13 +130,13 @@ function parsePltFile(filePath: string): GPSPoint[] {
 }
 
 /**
- * Load trajectories from archive directory
+ * Scan trajectories from archive directory (returns file paths, not loaded data)
  */
-function loadTrajectories(
+function scanTrajectories(
   userIds: string[] = [],
   sensorIds: string[] = []
-): Trajectory[] {
-  const trajectories: Trajectory[] = [];
+): TrajectoryFile[] {
+  const trajectoryFiles: TrajectoryFile[] = [];
 
   try {
     // Check if archive directory exists
@@ -187,48 +209,62 @@ function loadTrajectories(
 
       for (const pltFile of pltFiles) {
         const filePath = path.join(trajectoryDir, pltFile);
-        const points = parsePltFile(filePath);
 
-        if (points.length > 10) {
+        // Quick count of points without parsing full data
+        const content = fs.readFileSync(filePath, "utf-8");
+        const lineCount = content.split("\n").length - 7; // Subtract 6 header lines + 1
+        const pointCount = Math.max(0, lineCount);
+
+        if (pointCount > 10) {
           // Only include trajectories with enough points
-          trajectories.push({
+          trajectoryFiles.push({
             userId,
             trajectoryId: pltFile.replace(".plt", ""),
-            points,
+            filePath,
+            pointCount,
           });
           console.log(
-            `   ✓ Loaded ${pltFile.replace(".plt", "")} (${
-              points.length
-            } points)`
+            `   ✓ Found ${pltFile.replace(".plt", "")} (${pointCount} points)`
           );
         } else {
           console.log(
-            `   ⚠ Skipped ${pltFile.replace(".plt", "")} (only ${
-              points.length
-            } points)`
+            `   ⚠ Skipped ${pltFile.replace(
+              ".plt",
+              ""
+            )} (only ${pointCount} points)`
           );
         }
       }
     }
 
-    console.log(`\n✅ Loaded ${trajectories.length} trajectories total`);
+    console.log(`\n✅ Found ${trajectoryFiles.length} trajectories total`);
   } catch (err) {
-    console.error("❌ Error loading trajectories:", err);
+    console.error("❌ Error scanning trajectories:", err);
   }
 
-  return trajectories;
+  return trajectoryFiles;
 }
 
 /**
- * Replay trajectory to Redis stream
+ * Load and replay trajectory from file
  */
-async function replayTrajectory(
+async function loadAndReplayTrajectory(
   redis: Redis,
-  trajectory: Trajectory,
+  trajectoryFile: TrajectoryFile,
   speed: number
 ): Promise<void> {
-  const { userId, trajectoryId, points } = trajectory;
+  const { userId, trajectoryId, filePath, pointCount } = trajectoryFile;
   const sensorId = `${userId}-${trajectoryId}`;
+
+  console.log(`🎬 Loading trajectory: ${sensorId} (${pointCount} points)`);
+
+  // Load points from file
+  const points = parsePltFile(filePath);
+
+  if (points.length === 0) {
+    console.warn(`⚠️  No valid points in ${sensorId}, skipping`);
+    return;
+  }
 
   console.log(`🎬 Replaying trajectory: ${sensorId} (${points.length} points)`);
 
@@ -292,20 +328,23 @@ async function main() {
   // Show usage if help requested
   if (args.includes("--help") || args.includes("-h")) {
     console.log("Usage: npm run replay -- [options]");
+    console.log(
+      "\n⚠️  IMPORTANT: Always use '--' before arguments when using npm run"
+    );
     console.log("\nOptions:");
     console.log(
       "  --users, -u <ids>     Specify user IDs to load (comma or space separated)"
     );
     console.log("                        Example: --users 000,001,002");
-    console.log("                        Example: --users 000 001 002");
+    console.log('                        Example: --users "000 001 002"');
     console.log(
       "  --sensors, -s <ids>   Specify sensor IDs to load (comma or space separated)"
     );
     console.log("                        Example: --sensors 20081023025304");
     console.log(
-      "                        Example: --sensors 20081023025304,20081024020959"
+      '                        Example: --sensors "20081023025304,20081024020959"'
     );
-    console.log("\nShorthand (auto-detected by length):");
+    console.log("\nShorthand (auto-detected by length, RECOMMENDED):");
     console.log("  3-digit arguments = user IDs");
     console.log("  14-digit arguments = sensor IDs");
     console.log("  Example: npm run replay -- 001 20081028102805");
@@ -314,24 +353,31 @@ async function main() {
       "  REDIS_URL            Redis connection URL (default: redis://localhost:6379)"
     );
     console.log("  REPLAY_SPEED         Replay speed multiplier (default: 10)");
-    console.log("\nExamples:");
+    console.log("\n✅ Recommended Examples (shorthand auto-detect):");
+    console.log("  npm run replay -- 128 20070414005628 20070414123327");
+    console.log("  npm run replay -- 001 002 003");
+    console.log("  npm run replay -- 001");
+    console.log("\n📝 Alternative Examples (explicit flags):");
     console.log("  npm run replay");
     console.log("  npm run replay -- --users 001,002,003");
     console.log("  npm run replay -- --users 001 --sensors 20081023025304");
-    console.log("  npm run replay -- 001 20081028102805");
-    console.log("  npm run replay -- 001 002 20081023025304 20081024020959");
     console.log(
       "  REPLAY_SPEED=50 npm run replay -- --users 000 --sensors 20081023025304,20081024020959"
     );
     process.exit(0);
   }
 
-  // Load trajectories
-  const trajectories = loadTrajectories(USER_IDS, SENSOR_IDS);
+  // Scan trajectory files (lightweight metadata only)
+  const trajectoryFiles = scanTrajectories(USER_IDS, SENSOR_IDS);
 
-  if (trajectories.length === 0) {
-    console.error("❌ No trajectories loaded. Exiting.");
-    console.log("\n💡 Tip: Use --help to see usage information");
+  if (trajectoryFiles.length === 0) {
+    console.error("❌ No trajectories found. Exiting.");
+    if (USER_IDS.length > 0 || SENSOR_IDS.length > 0) {
+      console.log(
+        "\n💡 Tip: Check that the specified user/sensor IDs exist in the archive"
+      );
+    }
+    console.log("💡 Tip: Use --help to see usage information");
     process.exit(1);
   }
 
@@ -339,14 +385,30 @@ async function main() {
   const redis = new Redis(REDIS_URL);
   console.log(`📡 Connected to Redis: ${REDIS_URL}\n`);
 
-  // Replay trajectories in parallel
-  console.log(`⚡ Replay speed: ${REPLAY_SPEED}x real-time\n`);
-
-  const replayPromises = trajectories.map((trajectory) =>
-    replayTrajectory(redis, trajectory, REPLAY_SPEED)
+  // Process trajectories in batches to avoid memory overflow
+  console.log(`⚡ Replay speed: ${REPLAY_SPEED}x real-time`);
+  console.log(
+    `📦 Processing ${trajectoryFiles.length} trajectories in batches of ${BATCH_SIZE}\n`
   );
 
-  await Promise.all(replayPromises);
+  for (let i = 0; i < trajectoryFiles.length; i += BATCH_SIZE) {
+    const batch = trajectoryFiles.slice(i, i + BATCH_SIZE);
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(trajectoryFiles.length / BATCH_SIZE);
+
+    console.log(
+      `\n📦 Processing batch ${batchNum}/${totalBatches} (${batch.length} trajectories)`
+    );
+
+    // Replay batch in parallel
+    const replayPromises = batch.map((trajectoryFile) =>
+      loadAndReplayTrajectory(redis, trajectoryFile, REPLAY_SPEED)
+    );
+
+    await Promise.all(replayPromises);
+
+    console.log(`✅ Batch ${batchNum}/${totalBatches} complete`);
+  }
 
   console.log("\n✅ All trajectories replayed successfully!");
   await redis.quit();
