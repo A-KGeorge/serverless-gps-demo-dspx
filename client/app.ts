@@ -20,6 +20,7 @@ let pointsProcessed = 0;
 let velocitySum = 0;
 let velocityCount = 0;
 let currentSensor: string | null = null;
+let eventSource: EventSource | null = null;
 
 // UI elements
 const statusIndicator = document.getElementById("status") as HTMLElement;
@@ -73,13 +74,24 @@ function initMap() {
  * Connect to Redis pub/sub for processed GPS data
  */
 function connectToPubSub() {
-  // Use EventSource for server-sent events (we'll need a simple SSE endpoint)
-  const eventSource = new EventSource("/api/gps-stream");
+  // Check if we should filter by sensor (from URL params or dropdown)
+  const urlParams = new URLSearchParams(window.location.search);
+  const sensorFilter = urlParams.get("sensorId") || currentSensor;
+
+  // Build EventSource URL with optional filter
+  const streamUrl = sensorFilter
+    ? `/api/gps-stream?sensorId=${encodeURIComponent(sensorFilter)}`
+    : "/api/gps-stream";
+
+  console.log(`🔌 Connecting to SSE: ${streamUrl}`);
+  const eventSource = new EventSource(streamUrl);
 
   eventSource.onopen = () => {
     statusIndicator.classList.add("connected");
     statusIndicator.classList.remove("disconnected");
-    statusText.textContent = "Connected";
+    statusText.textContent = sensorFilter
+      ? `Connected (${sensorFilter})`
+      : "Connected (All)";
   };
 
   eventSource.onerror = () => {
@@ -98,6 +110,8 @@ function connectToPubSub() {
       console.error("Failed to parse GPS data:", err);
     }
   };
+
+  return eventSource;
 }
 
 /**
@@ -273,7 +287,13 @@ function updateTraceVisibility() {
  */
 function updateSensorFilter() {
   currentSensor = sensorSelect.value || null;
-  // Optionally clear map when switching sensors
+
+  // Reconnect with new filter
+  if (eventSource) {
+    console.log("🔄 Reconnecting with new filter...");
+    eventSource.close();
+    eventSource = connectToPubSub();
+  }
 }
 
 /**
@@ -306,6 +326,6 @@ themeToggleBtn.addEventListener("click", toggleTheme);
 
 // Initialize
 initMap();
-connectToPubSub();
+eventSource = connectToPubSub();
 
 console.log("🗺️ GPS Visualization Client ready");
