@@ -38,11 +38,85 @@ class GPSWorker {
   private stateManager: GPSStateManager;
   private pipeline: GPSPipeline;
   private running = false;
+  private pelCleanupInterval?: NodeJS.Timeout;
 
   constructor() {
     this.redis = new Redis(REDIS_URL);
     this.stateManager = new GPSStateManager(this.redis);
     this.pipeline = new GPSPipeline();
+  }
+
+  /**
+   * Recover pending messages that were not acknowledged
+   * Called on startup to handle crashed/interrupted processing
+   */
+  private async recoverPendingMessages(): Promise<void> {
+    console.log("🔍 Checking for pending messages...");
+
+    try {
+      // Get pending messages for this consumer group
+      // XPENDING returns [messageId, consumerName, idleTime, deliveryCount]
+      const pending = await this.redis.xpending(
+        INPUT_STREAM,
+        CONSUMER_GROUP,
+        "-", // start from oldest
+        "+", // to newest
+        100 // batch size
+      );
+
+      if (!Array.isArray(pending) || pending.length === 0) {
+        console.log("✅ No pending messages found");
+        return;
+      }
+
+      console.log(
+        `⚠️  Found ${pending.length} pending messages, recovering...`
+      );
+
+      // Process each pending message
+      for (const entry of pending) {
+        const [messageId, consumerName, idleTime, deliveryCount] = entry as [
+          string,
+          string,
+          number,
+          number
+        ];
+
+        // Only claim messages that have been idle for >30 seconds
+        // This prevents stealing messages from active workers
+        if (idleTime < 30000) {
+          continue;
+        }
+
+        try {
+          // Claim the message (take ownership from dead consumer)
+          const claimed = await this.redis.xclaim(
+            INPUT_STREAM,
+            CONSUMER_GROUP,
+            CONSUMER_NAME,
+            30000, // min idle time
+            messageId
+          );
+
+          if (claimed && claimed.length > 0) {
+            const [_claimedId, fields] = claimed[0] as [string, string[]];
+            console.log(
+              `📦 Recovered message: ${messageId} (delivery #${deliveryCount})`
+            );
+
+            // Process the recovered message
+            await this.processMessage(messageId, fields);
+          }
+        } catch (err) {
+          console.error(`❌ Failed to recover message ${messageId}:`, err);
+          // Don't ACK - let it retry later
+        }
+      }
+
+      console.log("✅ Pending message recovery complete");
+    } catch (err) {
+      console.error("❌ Error during PEL recovery:", err);
+    }
   }
 
   /**
@@ -77,6 +151,12 @@ class GPSWorker {
     console.log(`   Output channel: ${OUTPUT_CHANNEL}`);
 
     await this.initializeConsumerGroup();
+
+    // Recover any pending messages before starting main loop
+    await this.recoverPendingMessages();
+
+    // Start periodic PEL cleanup (every 5 minutes)
+    this.startPelCleanup();
 
     this.running = true;
 
@@ -189,6 +269,10 @@ class GPSWorker {
 
     await this.redis.publish(OUTPUT_CHANNEL, resultBuffer);
 
+    // Simulate slow processing to test crash recovery
+    // Remove this delay in production
+    // await this.sleep(100);
+
     // Acknowledge message
     await this.redis.xack(INPUT_STREAM, CONSUMER_GROUP, messageId);
 
@@ -205,11 +289,28 @@ class GPSWorker {
   }
 
   /**
+   * Start periodic PEL cleanup (every 5 minutes)
+   */
+  private startPelCleanup(): void {
+    this.pelCleanupInterval = setInterval(async () => {
+      if (this.running) {
+        await this.recoverPendingMessages();
+      }
+    }, 5 * 60 * 1000); // Every 5 minutes
+  }
+
+  /**
    * Stop processing loop
    */
   async stop(): Promise<void> {
     console.log("🛑 Stopping GPS Worker...");
     this.running = false;
+
+    // Clear PEL cleanup interval
+    if (this.pelCleanupInterval) {
+      clearInterval(this.pelCleanupInterval);
+    }
+
     await this.redis.quit();
   }
 
