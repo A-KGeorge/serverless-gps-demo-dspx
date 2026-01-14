@@ -83,13 +83,21 @@ export class GPSPipeline {
   private logBatchSize = 100; // Log every 100 samples
 
   constructor() {
-    // Initialize position pipeline with Kalman filter (2D: lat, lon)
+    // Initialize position pipeline with TimeAlignment + Kalman filter (2D: lat, lon)
     this.positionPipeline = createDspPipeline();
+
+    // TimeAlignment normalizes irregular GPS samples (1-5s intervals) to uniform 1 Hz
+    this.positionPipeline.TimeAlignment({
+      targetSampleRate: 1, // 1 Hz (1 sample/second)
+      interpolationMethod: "linear", // Linear interpolation between GPS points
+      gapPolicy: "interpolate", // Interpolate across gaps
+    });
+
     this.positionPipeline.KalmanFilter({
       dimensions: 2, // 2D tracking: lat, lon (library creates 4D state with velocity)
-      processNoise: 0.0001, // Process noise in degrees (~0.0001 deg = ~11m change)
-      measurementNoise: 0.0001, // GPS accuracy ~10m in degrees (~0.0001 deg)
-      initialError: 0.0001, // Initial position uncertainty in degrees
+      processNoise: 1e-5, // Trust smooth motion model (low process noise)
+      measurementNoise: 1e-2, // GPS is noisy - trust individual pings less
+      initialError: 1.0, // Higher initial uncertainty
     });
 
     // Initialize velocity pipeline with moving average (1D)
@@ -132,24 +140,26 @@ export class GPSPipeline {
 
     // Step 1: State loaded (passed in as parameter)
 
-    // Step 2: Apply Kalman filter to position
+    // Step 2: Apply TimeAlignment + Kalman filter to position
     const kalmanStart = performance.now();
 
-    // Prepare Kalman input: interleaved [lat, lon]
+    // Prepare input: interleaved [lat, lon] with timestamps
     const measurement = new Float32Array([point.lat, point.lon]);
 
-    // Calculate time delta (dt) in seconds since last point
-    // CRITICAL: dspx expects dt (elapsed time), not absolute timestamps
-    const dt =
-      state.lastTimestamp > 0
-        ? (point.timestamp - state.lastTimestamp) / 1000
-        : 0.1; // Default to 0.1s for first point
-    const positionDeltas = new Float32Array([dt, dt]);
+    // Calculate time delta in SECONDS (not milliseconds)
+    // Kalman filter expects dt in seconds for velocity units (degrees/second)
+    let dtSeconds: number;
+    if (state.lastTimestamp > 0) {
+      dtSeconds = (point.timestamp - state.lastTimestamp) / 1000; // Convert ms to seconds
+    } else {
+      dtSeconds = 1.0; // Default 1 second for first sample
+    }
 
-    // Process through Kalman filter
+    // Pass dt in SECONDS for both channels
+    const timestamps = new Float32Array([dtSeconds, dtSeconds]);
     const smoothedPosition = await this.positionPipeline.process(
       measurement,
-      positionDeltas,
+      timestamps,
       { channels: 2 }
     );
 
@@ -167,8 +177,8 @@ export class GPSPipeline {
       smoothedLat,
       smoothedLon // Current position
     );
-    // dt already calculated above, reuse it
-    const instantVelocity = dt > 0 ? distance / dt : 0;
+    // Use actual dt (already in seconds) for velocity calculation
+    const instantVelocity = dtSeconds > 0 ? distance / dtSeconds : 0;
     latency.differentiatorMs = performance.now() - diffStart;
 
     // Step 4: Smooth velocity through moving average
@@ -178,14 +188,18 @@ export class GPSPipeline {
     state.velocityBuffer[state.velocityIndex] = instantVelocity;
     state.velocityIndex = (state.velocityIndex + 1) % VELOCITY_WINDOW_SIZE;
 
-    // Prepare velocity array with time deltas
+    // Prepare velocity array with uniform timestamps (1 Hz = 1000ms intervals)
     const velocityArray = new Float32Array(state.velocityBuffer);
-    // Use same dt for all velocity samples (uniform sampling assumption)
-    const velocityDeltas = new Float32Array(VELOCITY_WINDOW_SIZE).fill(dt);
+    const baseTimestamp = point.timestamp;
+    const velocityTimestamps = new Float32Array(VELOCITY_WINDOW_SIZE);
+    for (let i = 0; i < VELOCITY_WINDOW_SIZE; i++) {
+      velocityTimestamps[i] =
+        baseTimestamp - (VELOCITY_WINDOW_SIZE - 1 - i) * 1000;
+    }
 
     // Process velocity through moving average
     const smoothedVelocityArray = await this.velocityPipeline
-      .process(velocityArray, velocityDeltas, { channels: 1 })
+      .process(velocityArray, velocityTimestamps, { channels: 1 })
       .then((result) => result[result.length - 1] || 0);
 
     latency.dspPipelineMs = performance.now() - velocityStart;

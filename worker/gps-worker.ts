@@ -271,7 +271,7 @@ class GPSWorker {
 
     // Simulate slow processing to test crash recovery
     // Remove this delay in production
-    // await this.sleep(100);
+    await this.sleep(100);
 
     // Acknowledge message
     await this.redis.xack(INPUT_STREAM, CONSUMER_GROUP, messageId);
