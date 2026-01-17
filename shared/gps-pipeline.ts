@@ -7,7 +7,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { createDspPipeline } from "dspx";
-import type { KalmanState } from "./state-manager.js";
+import type { AppState } from "./state-manager.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,7 +55,7 @@ function haversineDistance(
   lat1: number,
   lon1: number,
   lat2: number,
-  lon2: number
+  lon2: number,
 ): number {
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
   const dLon = ((lon2 - lon1) * Math.PI) / 180;
@@ -82,6 +82,20 @@ export class GPSPipeline {
   private latencyStats: LatencyStats[] = [];
   private logBatchSize = 100; // Log every 100 samples
 
+  /**
+   * Get position pipeline for state management
+   */
+  getPositionPipeline(): ReturnType<typeof createDspPipeline> {
+    return this.positionPipeline;
+  }
+
+  /**
+   * Get velocity pipeline for state management
+   */
+  getVelocityPipeline(): ReturnType<typeof createDspPipeline> {
+    return this.velocityPipeline;
+  }
+
   constructor() {
     // Initialize position pipeline with TimeAlignment + Kalman filter (2D: lat, lon)
     this.positionPipeline = createDspPipeline();
@@ -96,8 +110,8 @@ export class GPSPipeline {
     this.positionPipeline.KalmanFilter({
       dimensions: 2, // 2D tracking: lat, lon (library creates 4D state with velocity)
       processNoise: 1e-5, // Trust smooth motion model (low process noise)
-      measurementNoise: 1e-2, // GPS is noisy - trust individual pings less
-      initialError: 1.0, // Higher initial uncertainty
+      measurementNoise: 1e-4, // GPS is noisy - trust individual pings less
+      initialError: 0.001, // Higher initial uncertainty
     });
 
     // Initialize velocity pipeline with moving average (1D)
@@ -117,7 +131,7 @@ export class GPSPipeline {
     if (!fs.existsSync(LOG_FILE)) {
       fs.writeFileSync(
         LOG_FILE,
-        "timestamp,sensorId,kalmanMs,differentiatorMs,dspPipelineMs,totalMs\n"
+        "timestamp,sensorId,kalmanMs,differentiatorMs,dspPipelineMs,totalMs\n",
       );
     }
   }
@@ -127,9 +141,9 @@ export class GPSPipeline {
    */
   async process(
     point: GPSPoint,
-    state: KalmanState,
-    sensorId?: string
-  ): Promise<{ result: ProcessedGPS; newState: KalmanState }> {
+    appState: AppState,
+    sensorId?: string,
+  ): Promise<{ result: ProcessedGPS; newAppState: AppState }> {
     const startTime = performance.now();
     const latency: LatencyStats = {
       kalmanMs: 0,
@@ -138,7 +152,7 @@ export class GPSPipeline {
       totalMs: 0,
     };
 
-    // Step 1: State loaded (passed in as parameter)
+    // Step 1: State loaded (pipeline state managed internally by dspx)
 
     // Step 2: Apply TimeAlignment + Kalman filter to position
     const kalmanStart = performance.now();
@@ -149,8 +163,8 @@ export class GPSPipeline {
     // Calculate time delta in SECONDS (not milliseconds)
     // Kalman filter expects dt in seconds for velocity units (degrees/second)
     let dtSeconds: number;
-    if (state.lastTimestamp > 0) {
-      dtSeconds = (point.timestamp - state.lastTimestamp) / 1000; // Convert ms to seconds
+    if (appState.lastTimestamp > 0) {
+      dtSeconds = (point.timestamp - appState.lastTimestamp) / 1000; // Convert ms to seconds
     } else {
       dtSeconds = 1.0; // Default 1 second for first sample
     }
@@ -160,7 +174,7 @@ export class GPSPipeline {
     const smoothedPosition = await this.positionPipeline.process(
       measurement,
       timestamps,
-      { channels: 2 }
+      { channels: 2 },
     );
 
     // Extract smoothed position
@@ -172,10 +186,10 @@ export class GPSPipeline {
     // Step 3: Calculate instantaneous velocity (differentiator)
     const diffStart = performance.now();
     const distance = haversineDistance(
-      state.x[0],
-      state.x[1], // Previous position
+      appState.prevLat,
+      appState.prevLon, // Previous position
       smoothedLat,
-      smoothedLon // Current position
+      smoothedLon, // Current position
     );
     // Use actual dt (already in seconds) for velocity calculation
     const instantVelocity = dtSeconds > 0 ? distance / dtSeconds : 0;
@@ -185,11 +199,12 @@ export class GPSPipeline {
     const velocityStart = performance.now();
 
     // Update circular buffer
-    state.velocityBuffer[state.velocityIndex] = instantVelocity;
-    state.velocityIndex = (state.velocityIndex + 1) % VELOCITY_WINDOW_SIZE;
+    appState.velocityBuffer[appState.velocityIndex] = instantVelocity;
+    appState.velocityIndex =
+      (appState.velocityIndex + 1) % VELOCITY_WINDOW_SIZE;
 
     // Prepare velocity array with uniform timestamps (1 Hz = 1000ms intervals)
-    const velocityArray = new Float32Array(state.velocityBuffer);
+    const velocityArray = new Float32Array(appState.velocityBuffer);
     const baseTimestamp = point.timestamp;
     const velocityTimestamps = new Float32Array(VELOCITY_WINDOW_SIZE);
     for (let i = 0; i < VELOCITY_WINDOW_SIZE; i++) {
@@ -216,13 +231,14 @@ export class GPSPipeline {
     // Determine movement status
     const isMoving = smoothedVelocityArray > MOVEMENT_THRESHOLD;
 
-    // Step 5: Update state for persistence (caller will save)
-    const newState: KalmanState = {
-      x: new Float64Array([smoothedLat, smoothedLon, 0, 0]), // Store smoothed position
-      P: state.P, // Keep covariance (managed internally by dspx)
-      velocityBuffer: state.velocityBuffer,
-      velocityIndex: state.velocityIndex,
+    // Step 5: Update app state for persistence
+    // Pipeline state (Kalman, TimeAlignment) is managed internally by dspx
+    const newAppState: AppState = {
+      velocityBuffer: appState.velocityBuffer,
+      velocityIndex: appState.velocityIndex,
       lastTimestamp: point.timestamp,
+      prevLat: smoothedLat,
+      prevLon: smoothedLon,
     };
 
     const result: ProcessedGPS = {
@@ -237,7 +253,7 @@ export class GPSPipeline {
       processingLatencyMs: latency.totalMs,
     };
 
-    return { result, newState };
+    return { result, newAppState };
   }
 
   /**
@@ -272,8 +288,8 @@ export class GPSPipeline {
         `Diff=${avg(diffTimes).toFixed(2)}ms, ` +
         `DSP=${avg(dspTimes).toFixed(2)}ms, ` +
         `Total=${avg(totalTimes).toFixed(2)}ms (max=${max(totalTimes).toFixed(
-          2
-        )}ms)`
+          2,
+        )}ms)`,
     );
 
     // Clear stats
@@ -285,20 +301,20 @@ export class GPSPipeline {
    */
   async processBatch(
     points: GPSPoint[],
-    initialState: KalmanState,
-    sensorId?: string
+    initialAppState: AppState,
+    sensorId?: string,
   ): Promise<ProcessedGPS[]> {
     const results: ProcessedGPS[] = [];
-    let currentState = initialState;
+    let currentAppState = initialAppState;
 
     for (const point of points) {
-      const { result, newState } = await this.process(
+      const { result, newAppState } = await this.process(
         point,
-        currentState,
-        sensorId
+        currentAppState,
+        sensorId,
       );
       results.push(result);
-      currentState = newState;
+      currentAppState = newAppState;
     }
 
     // Flush any remaining latency stats

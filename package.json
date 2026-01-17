@@ -17,7 +17,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "dspx": "^1.4.0",
+    "dspx": "^1.4.1",
     "express": "^4.19.2",
     "ioredis": "^5.4.1",
     "leaflet": "^1.9.4"

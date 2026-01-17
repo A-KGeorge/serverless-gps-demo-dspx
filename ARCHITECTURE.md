@@ -8,11 +8,11 @@ This demo implements a **serverless, event-driven architecture** for real-time G
 flowchart TD
     Dataset[📦 Geolife Dataset<br/>./archive/<br/>182 users, ~18k trajectories]
 
-    Replay[🎬 Data Replay<br/>data/replay.ts<br/>• Parses PLT files<br/>• Time-scaled replay 10x<br/>• Parallel streaming]
+    Replay[🎬 Data Replay<br/>data/replay.ts<br/>• Parses PLT files<br/>• Time-scaled replay 30x<br/>• Parallel streaming]
 
     RedisStream[(💾 Redis Stream<br/>gps:raw<br/>Raw GPS points)]
 
-    Worker[⚙️ Single Worker<br/>worker/gps-worker.ts<br/>Consumer: gps-workers<br/>• Kalman Filter 2D<br/>• Haversine Distance<br/>• Moving Average 1D<br/>• All in one process]
+    Worker[⚙️ Single Worker<br/>worker/gps-worker.ts<br/>Consumer: gps-workers<br/>• Time Alignment<br/>• Kalman Filter 2D<br/>• Haversine Distance<br/>• Moving Average 1D<br/>• All in one process]
 
     RedisPubSub[(💾 Redis Pub/Sub<br/>gps:processed<br/>Final output)]
 
@@ -144,7 +144,7 @@ Based on actual latency measurements:
 flowchart TD
     Dataset[📦 Geolife Dataset<br/>./archive/<br/>182 users, ~18k trajectories]
 
-    Replay[🎬 Data Replay<br/>data/replay.ts<br/>• Parses PLT files<br/>• Time-scaled replay 10x<br/>• Parallel streaming]
+    Replay[🎬 Data Replay<br/>data/replay.ts<br/>• Parses PLT files<br/>• Time-scaled replay 30x<br/>• Parallel streaming]
 
     RedisStream1[(💾 Redis Stream<br/>gps:raw<br/>Raw GPS points)]
 

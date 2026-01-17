@@ -16,7 +16,7 @@ const __dirname = dirname(__filename);
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
 const INPUT_STREAM = "gps:raw";
 const ARCHIVE_DIR = path.join(__dirname, "../archive");
-const REPLAY_SPEED = parseFloat(process.env.REPLAY_SPEED || "10"); // 10x real-time
+const REPLAY_SPEED = parseFloat(process.env.REPLAY_SPEED || "30"); // 30x real-time
 const BATCH_SIZE = 10; // Process N trajectories at a time to avoid memory overflow
 
 // Parse command-line arguments

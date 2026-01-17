@@ -78,7 +78,7 @@ Leaflet Map Visualization
 REDIS_URL=redis://localhost:6379
 
 # Replay settings
-REPLAY_SPEED=10          # 10x real-time (default)
+REPLAY_SPEED=30         # 30x real-time (default)
 NUM_TRAJECTORIES=3       # Number of trajectories to load (default)
 ```
 

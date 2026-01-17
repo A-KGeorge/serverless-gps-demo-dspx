@@ -61,7 +61,7 @@ class GPSWorker {
         CONSUMER_GROUP,
         "-", // start from oldest
         "+", // to newest
-        100 // batch size
+        100, // batch size
       );
 
       if (!Array.isArray(pending) || pending.length === 0) {
@@ -70,7 +70,7 @@ class GPSWorker {
       }
 
       console.log(
-        `⚠️  Found ${pending.length} pending messages, recovering...`
+        `⚠️  Found ${pending.length} pending messages, recovering...`,
       );
 
       // Process each pending message
@@ -79,7 +79,7 @@ class GPSWorker {
           string,
           string,
           number,
-          number
+          number,
         ];
 
         // Only claim messages that have been idle for >30 seconds
@@ -95,13 +95,13 @@ class GPSWorker {
             CONSUMER_GROUP,
             CONSUMER_NAME,
             30000, // min idle time
-            messageId
+            messageId,
           );
 
           if (claimed && claimed.length > 0) {
             const [_claimedId, fields] = claimed[0] as [string, string[]];
             console.log(
-              `📦 Recovered message: ${messageId} (delivery #${deliveryCount})`
+              `📦 Recovered message: ${messageId} (delivery #${deliveryCount})`,
             );
 
             // Process the recovered message
@@ -129,7 +129,7 @@ class GPSWorker {
         INPUT_STREAM,
         CONSUMER_GROUP,
         "0",
-        "MKSTREAM"
+        "MKSTREAM",
       );
       console.log(`✅ Created consumer group: ${CONSUMER_GROUP}`);
     } catch (err: any) {
@@ -173,7 +173,7 @@ class GPSWorker {
           BLOCK_MS,
           "STREAMS",
           INPUT_STREAM,
-          ">"
+          ">",
         );
 
         if (!results || results.length === 0) {
@@ -183,7 +183,7 @@ class GPSWorker {
         // Process messages
         const [_streamName, messages] = results[0] as [
           string,
-          [string, string[]][]
+          [string, string[]][],
         ];
 
         for (const [messageId, fields] of messages) {
@@ -208,7 +208,7 @@ class GPSWorker {
    */
   private async processMessage(
     messageId: string,
-    fields: string[]
+    fields: string[],
   ): Promise<void> {
     // Parse message fields (Redis returns flat array: [key1, val1, key2, val2, ...])
     const data: Record<string, string> = {};
@@ -235,30 +235,40 @@ class GPSWorker {
       return;
     }
 
-    // Load state
-    let state = await this.stateManager.loadState(rawPoint.sensorId);
-    if (!state) {
-      // Initialize state if not found
-      state = this.stateManager.createInitialState(
+    // Load state (pipeline + app state)
+    let appState = await this.stateManager.loadState(
+      rawPoint.sensorId,
+      this.pipeline.getPositionPipeline(),
+      this.pipeline.getVelocityPipeline(),
+    );
+
+    // Initialize app state if this is the first point
+    if (appState.lastTimestamp === 0) {
+      appState = this.stateManager.createInitialState(
         rawPoint.lat,
         rawPoint.lon,
-        rawPoint.timestamp
+        rawPoint.timestamp,
       );
     }
 
-    // Process through pipeline (now async with dspx timestamps)
-    const { result: processed, newState } = await this.pipeline.process(
+    // Process through pipeline (dspx manages pipeline state internally)
+    const { result: processed, newAppState } = await this.pipeline.process(
       {
         lat: rawPoint.lat,
         lon: rawPoint.lon,
         timestamp: rawPoint.timestamp,
       },
-      state,
-      rawPoint.sensorId
+      appState,
+      rawPoint.sensorId,
     );
 
-    // Save updated state
-    await this.stateManager.saveState(rawPoint.sensorId, newState);
+    // Save updated state (pipeline + app state)
+    await this.stateManager.saveState(
+      rawPoint.sensorId,
+      this.pipeline.getPositionPipeline(),
+      this.pipeline.getVelocityPipeline(),
+      newAppState,
+    );
 
     // Publish result (use TOON binary format for efficiency)
     const resultBuffer = this.serializeToon({
@@ -271,7 +281,7 @@ class GPSWorker {
 
     // Simulate slow processing to test crash recovery
     // Remove this delay in production
-    await this.sleep(100);
+    // await this.sleep(100);
 
     // Acknowledge message
     await this.redis.xack(INPUT_STREAM, CONSUMER_GROUP, messageId);
@@ -283,8 +293,8 @@ class GPSWorker {
         `${status} | ` +
         `v=${processed.smoothedVelocity.toFixed(2)} m/s | ` +
         `[${processed.smoothedLat.toFixed(6)}, ${processed.smoothedLon.toFixed(
-          6
-        )}]`
+          6,
+        )}]`,
     );
   }
 
@@ -292,11 +302,14 @@ class GPSWorker {
    * Start periodic PEL cleanup (every 5 minutes)
    */
   private startPelCleanup(): void {
-    this.pelCleanupInterval = setInterval(async () => {
-      if (this.running) {
-        await this.recoverPendingMessages();
-      }
-    }, 5 * 60 * 1000); // Every 5 minutes
+    this.pelCleanupInterval = setInterval(
+      async () => {
+        if (this.running) {
+          await this.recoverPendingMessages();
+        }
+      },
+      5 * 60 * 1000,
+    ); // Every 5 minutes
   }
 
   /**
