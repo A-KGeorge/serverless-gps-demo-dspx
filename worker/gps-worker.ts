@@ -44,6 +44,7 @@ class GPSWorker {
     this.redis = new Redis(REDIS_URL);
     this.stateManager = new GPSStateManager(this.redis);
     this.pipeline = new GPSPipeline();
+    console.log("Worker initialized with pid: ", process.pid);
   }
 
   /**

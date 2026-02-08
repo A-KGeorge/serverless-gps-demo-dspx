@@ -4,6 +4,7 @@ export default defineConfig({
   root: ".",
   publicDir: "public",
   server: {
+    host: "0.0.0.0",
     port: 5173,
     proxy: {
       // Proxy API requests to SSE server
