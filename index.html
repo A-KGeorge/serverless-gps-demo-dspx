@@ -234,100 +234,96 @@
         background: #33cc33;
       }
 
-      /* Mobile styles */
-      @media (max-width: 768px) {
-        header {
-          position: fixed;
-          top: 1rem;
-          left: 1rem;
-          right: 1rem;
-          z-index: 1001;
-          padding: 0.75rem 1rem;
-          border-radius: 12px;
-          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-          max-width: calc(100% - 2rem);
-        }
-
-        h1 {
-          font-size: 1.125rem;
-        }
-
-        .subtitle {
-          font-size: 0.75rem;
-        }
-
-        .controls {
-          position: fixed;
-          top: 6rem;
-          right: 1rem;
-          left: 1rem;
-          z-index: 1000;
-          padding: 1rem;
-          border-radius: 12px;
-          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-          flex-direction: column;
-          align-items: stretch;
-          gap: 0.75rem;
-          max-height: calc(100vh - 8rem);
-          overflow-y: auto;
-          transform: translateX(calc(100% + 2rem));
-          transition: transform 0.3s ease;
-        }
-
-        .controls.open {
-          transform: translateX(0);
-        }
-
-        .stats {
-          flex-direction: column;
-          gap: 0.5rem;
-        }
-
-        .legend {
-          bottom: 5.5rem;
-          right: 1rem;
-          padding: 0.75rem;
-        }
-
-        .fab {
-          position: fixed;
-          bottom: 1.5rem;
-          right: 1.5rem;
-          width: 56px;
-          height: 56px;
-          border-radius: 50%;
-          background: #0066cc;
-          color: white;
-          border: none;
-          box-shadow: 0 4px 12px rgba(0, 102, 204, 0.4);
-          cursor: pointer;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          font-size: 1.5rem;
-          z-index: 1002;
-          transition:
-            transform 0.3s ease,
-            background 0.2s;
-        }
-
-        .fab:active {
-          transform: scale(0.95);
-        }
-
-        .fab.open {
-          background: #cc3333;
-        }
-
-        body.light-mode .fab {
-          box-shadow: 0 4px 12px rgba(0, 102, 204, 0.3);
-        }
+      /* Touch device styles */
+      body.touch-device header {
+        position: fixed;
+        top: 1rem;
+        left: 1rem;
+        right: 1rem;
+        z-index: 1001;
+        padding: 0.75rem 1rem;
+        border-radius: 12px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        max-width: calc(100% - 2rem);
       }
 
-      @media (min-width: 769px) {
-        .fab {
-          display: none;
-        }
+      body.touch-device h1 {
+        font-size: 1.125rem;
+      }
+
+      body.touch-device .subtitle {
+        font-size: 0.75rem;
+      }
+
+      body.touch-device .controls {
+        position: fixed;
+        top: 6rem;
+        right: 1rem;
+        left: 1rem;
+        z-index: 1000;
+        padding: 1rem;
+        border-radius: 12px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.75rem;
+        max-height: calc(100vh - 8rem);
+        overflow-y: auto;
+        transform: translateX(calc(100% + 2rem));
+        transition: transform 0.3s ease;
+      }
+
+      body.touch-device .controls.open {
+        transform: translateX(0);
+      }
+
+      body.touch-device .stats {
+        flex-direction: column;
+        gap: 0.5rem;
+      }
+
+      body.touch-device .legend {
+        bottom: 5.5rem;
+        right: 1rem;
+        padding: 0.75rem;
+      }
+
+      body.touch-device .fab {
+        position: fixed;
+        bottom: 1.5rem;
+        right: 1.5rem;
+        width: 56px;
+        height: 56px;
+        border-radius: 50%;
+        background: #0066cc;
+        color: white;
+        border: none;
+        box-shadow: 0 4px 12px rgba(0, 102, 204, 0.4);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.5rem;
+        z-index: 1002;
+        transition:
+          transform 0.3s ease,
+          background 0.2s;
+      }
+
+      body.touch-device .fab:active {
+        transform: scale(0.95);
+      }
+
+      body.touch-device .fab.open {
+        background: #cc3333;
+      }
+
+      body.touch-device.light-mode .fab {
+        box-shadow: 0 4px 12px rgba(0, 102, 204, 0.3);
+      }
+
+      body:not(.touch-device) .fab {
+        display: none;
       }
     </style>
   </head>
@@ -408,6 +404,16 @@
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script type="module" src="/client/app.ts"></script>
     <script>
+      // Detect touch capability
+      const isTouchDevice =
+        "ontouchstart" in window ||
+        navigator.maxTouchPoints > 0 ||
+        navigator.msMaxTouchPoints > 0;
+
+      if (isTouchDevice) {
+        document.body.classList.add("touch-device");
+      }
+
       // Mobile FAB toggle
       const fab = document.getElementById("fab-toggle");
       const controls = document.querySelector(".controls");
@@ -419,10 +425,10 @@
           fab.textContent = fab.classList.contains("open") ? "✕" : "⚙️";
         });
 
-        // Close controls when clicking outside on mobile
+        // Close controls when clicking outside on touch devices
         document.addEventListener("click", (e) => {
           if (
-            window.innerWidth <= 768 &&
+            isTouchDevice &&
             controls.classList.contains("open") &&
             !controls.contains(e.target) &&
             !fab.contains(e.target)
